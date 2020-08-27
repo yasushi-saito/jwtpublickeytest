@@ -1,16 +1,29 @@
 package main
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
+	"flag"
 	"io/ioutil"
 	"log"
+	"os"
+	"os/exec"
 	"time"
 
 	"github.com/dgrijalva/jwt-go"
+)
+
+var (
+	generateRandomKeysFlag = flag.Bool("generate-random-keys", false,
+		"Generate a random ECDSA private/public key pairs and store them in keys/*.pem")
+
+	terraformFlag = flag.Bool("terraform", false,
+		"Generate a random ECDSA private/public key pairs using terraform and store them in keys/*.pem.")
 )
 
 func generatePrivateKey() *ecdsa.PrivateKey {
@@ -71,9 +84,56 @@ func sign(privPEM []byte, claims jwt.MapClaims) (tokenStr string) {
 }
 
 func main() {
-	privKey := generatePrivateKey()
-	privPEM := privatePEM(privKey)
-	if err := ioutil.WriteFile("private.pem", privPEM, 0600); err != nil {
+	flag.Parse()
+	var privPEM, pubPEM []byte
+
+	if *generateRandomKeysFlag {
+		privKey := generatePrivateKey()
+		privPEM = privatePEM(privKey)
+		pubPEM = publicPEM(&privKey.PublicKey)
+	} else {
+		if !*terraformFlag {
+			log.Panic("Exactly one of -generate-random-keys or -terraform must be set")
+		}
+		if err := exec.Command("terraform", "init").Run(); err != nil {
+			log.Panic(err)
+		}
+		if err := exec.Command("terraform", "apply", "-auto-approve").Run(); err != nil {
+			log.Panic(err)
+		}
+		out := bytes.Buffer{}
+		cmd := exec.Command("terraform", "show", "-json")
+		cmd.Stdout = &out
+		if err := cmd.Run(); err != nil {
+			log.Panic(err)
+		}
+		cmd = exec.Command("jq", ".values.root_module.resources[0].values")
+		cmd.Stdin = &out
+		jsout := bytes.Buffer{}
+		cmd.Stdout = &jsout
+		if err := cmd.Run(); err != nil {
+			log.Panic(err)
+		}
+		var js struct {
+			Algorithm     string `json:"algorithm"`
+			ECSDACurve    string `json:"ecdsa_curve"`
+			PrivateKeyPEM string `json:"private_key_pem"`
+			PublicKeyPEM  string `json:"public_key_pem"`
+		}
+		if err := json.Unmarshal(jsout.Bytes(), &js); err != nil {
+			log.Panic(err)
+		}
+		privPEM = []byte(js.PrivateKeyPEM)
+		pubPEM = []byte(js.PublicKeyPEM)
+	}
+
+	if err := os.MkdirAll("keys", 0755); err != nil {
+		log.Panic(err)
+	}
+	if err := ioutil.WriteFile("keys/private.pem", privPEM, 0600); err != nil {
+		log.Panic(err)
+	}
+	if err := ioutil.WriteFile("keys/public.pem", pubPEM, 0600); err != nil {
 		log.Panic(err)
 	}
 
@@ -86,11 +146,7 @@ func main() {
 	}
 	tokenStr := sign(privPEM, claims)
 	log.Print("token:", tokenStr)
-	pubPEM := publicPEM(&privKey.PublicKey)
-	if err := ioutil.WriteFile("public.pem", pubPEM, 0600); err != nil {
-		log.Panic(err)
-	}
-	if err := ioutil.WriteFile("claims.txt", []byte(tokenStr), 0600); err != nil {
+	if err := ioutil.WriteFile("keys/claims.txt", []byte(tokenStr), 0600); err != nil {
 		log.Panic(err)
 	}
 	verify(pubPEM, tokenStr)
